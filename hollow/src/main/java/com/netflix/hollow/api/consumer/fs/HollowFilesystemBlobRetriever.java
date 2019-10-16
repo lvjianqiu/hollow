@@ -16,6 +16,8 @@
  */
 package com.netflix.hollow.api.consumer.fs;
 
+import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
+
 import com.netflix.hollow.api.consumer.HollowConsumer;
 import com.netflix.hollow.core.HollowConstants;
 import java.io.BufferedInputStream;
@@ -26,11 +28,12 @@ import java.io.OutputStream;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.UUID;
 
 public class HollowFilesystemBlobRetriever implements HollowConsumer.BlobRetriever {
-    
-    private final HollowConsumer.BlobRetriever fallbackBlobRetriever;
     private final Path blobStorePath;
+    private final HollowConsumer.BlobRetriever fallbackBlobRetriever;
+    private final boolean noFallBackForExistingSnapshot;
 
     /**
      * A new HollowFilesystemBlobRetriever which is not backed by a remote store.
@@ -48,13 +51,32 @@ public class HollowFilesystemBlobRetriever implements HollowConsumer.BlobRetriev
      * is requested which exists locally, then the local copy is used.  When a blob from the remote store is
      * requested which does not exist locally, it is copied to the filesystem right before it is loaded.
      *
-     * @param blobStorePath           The directory from which to retrieve blobs, if available
-     * @param fallbackBlobRetriever  The remote blob retriever from which to retrieve blobs if they are not already available on the filesystem.
+     * @param blobStorePath          The directory from which to retrieve blobs, if available
+     * @param fallbackBlobRetriever  The remote blob retriever from which to retrieve blobs if they are not already
+     *                               available on the filesystem.
      * @since 2.12.0
      */
     public HollowFilesystemBlobRetriever(Path blobStorePath, HollowConsumer.BlobRetriever fallbackBlobRetriever) {
+        this(blobStorePath, fallbackBlobRetriever, false);
+    }
+
+    /**
+     * A new HollowFileSystemBlobRetriever which is backed by a remote store.  When a blob from the remote store
+     * is requested which exists locally, then the local copy is used.  When a blob from the remote store is
+     * requested which does not exist locally, it is copied to the filesystem right before it is loaded.
+     *
+     * @param blobStorePath          The directory from which to retrieve blobs, if available
+     * @param fallbackBlobRetriever  The remote blob retriever from which to retrieve blobs if they are not already
+     *                               available on the filesystem.
+     * @param noFallBackForExistingSnapshot  If true and a snapshot blob is requested then if there exists a local snapshot
+     *                               blob present for the desired version then that snapshot blob is returned and
+     *                               the fallback blob retriever (if present) is not queried.
+     */
+    public HollowFilesystemBlobRetriever(Path blobStorePath, HollowConsumer.BlobRetriever fallbackBlobRetriever,
+            boolean noFallBackForExistingSnapshot) {
         this.blobStorePath = blobStorePath;
         this.fallbackBlobRetriever = fallbackBlobRetriever;
+        this.noFallBackForExistingSnapshot = noFallBackForExistingSnapshot;
 
         try {
             if(!Files.exists(this.blobStorePath)){
@@ -91,8 +113,13 @@ public class HollowFilesystemBlobRetriever implements HollowConsumer.BlobRetriev
         }
 
         HollowConsumer.Blob filesystemBlob = null;
-        if (maxVersionBeforeDesired != HollowConstants.VERSION_NONE)
-            filesystemBlob = new FilesystemBlob(blobStorePath.resolve(maxVersionBeforeDesiredFilename), maxVersionBeforeDesired);
+        if (maxVersionBeforeDesired != HollowConstants.VERSION_NONE) {
+            filesystemBlob = new FilesystemBlob(blobStorePath.resolve(maxVersionBeforeDesiredFilename),
+                    maxVersionBeforeDesired);
+            if (noFallBackForExistingSnapshot) {
+                return filesystemBlob;
+            }
+        }
 
         if(fallbackBlobRetriever != null) {
             HollowConsumer.Blob remoteBlob = fallbackBlobRetriever.retrieveSnapshotBlob(desiredVersion);
@@ -196,15 +223,17 @@ public class HollowFilesystemBlobRetriever implements HollowConsumer.BlobRetriev
         @Override
         public InputStream getInputStream() throws IOException {
 
+            Path tempPath = path.resolveSibling(path.getName(path.getNameCount()-1) + "-" + UUID.randomUUID().toString());
             try(
                     InputStream is = remoteBlob.getInputStream();
-                    OutputStream os = Files.newOutputStream(path)
+                    OutputStream os = Files.newOutputStream(tempPath)
             ) {
                 byte buf[] = new byte[4096];
                 int n;
                 while (-1 != (n = is.read(buf)))
                     os.write(buf, 0, n);
             }
+            Files.move(tempPath, path, REPLACE_EXISTING);
 
             return new BufferedInputStream(Files.newInputStream(path));
         }

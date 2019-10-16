@@ -138,9 +138,19 @@ public class HollowClientUpdater {
                 return true;
 
             if (updatePlan.isSnapshotPlan()) {
-                if (hollowDataHolderVolatile == null || doubleSnapshotConfig.allowDoubleSnapshot()) {
-                    hollowDataHolderVolatile = newHollowDataHolder();
-                    hollowDataHolderVolatile.update(updatePlan, localListeners);
+                HollowDataHolder oldDh = hollowDataHolderVolatile;
+                if (oldDh == null || doubleSnapshotConfig.allowDoubleSnapshot()) {
+                    // The volatile field needs to be assigned here because it may be accessed when
+                    // executing the update plan, for example a refresh listener may access the consumer
+                    // after the plan has been applied (such as a unique key indexer).
+                    HollowDataHolder newDh = hollowDataHolderVolatile = newHollowDataHolder();
+                    try {
+                        newDh.update(updatePlan, localListeners);
+                    } catch (Throwable t) {
+                        // If the update plan failed then revert back to the old holder
+                        hollowDataHolderVolatile = oldDh;
+                        throw t;
+                    }
                     forceDoubleSnapshot = false;
                 }
             } else {
@@ -212,8 +222,9 @@ public class HollowClientUpdater {
 
     private HollowDataHolder newHollowDataHolder() {
         return new HollowDataHolder(newStateEngine(), apiFactory,
-                failedTransitionTracker, staleReferenceDetector,
-                objectLongevityConfig).setFilter(filter);
+                doubleSnapshotConfig, failedTransitionTracker,
+                staleReferenceDetector, objectLongevityConfig)
+                .setFilter(filter);
     }
 
     private HollowReadStateEngine newStateEngine() {

@@ -41,6 +41,7 @@ import java.io.OutputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executor;
 
 /**
@@ -627,7 +628,12 @@ public class HollowProducer extends AbstractHollowProducer {
     }
 
     public interface Announcer {
+
         void announce(long stateVersion);
+
+        default void announce(long stateVersion, Map<String, String> metadata) {
+            announce(stateVersion);
+        }
     }
 
     public static HollowProducer.Builder<?> withPublisher(HollowProducer.Publisher publisher) {
@@ -651,6 +657,7 @@ public class HollowProducer extends AbstractHollowProducer {
         BlobStorageCleaner blobStorageCleaner = new DummyBlobStorageCleaner();
         SingleProducerEnforcer singleProducerEnforcer = new BasicSingleProducerEnforcer();
         HollowObjectHashCodeFinder hashCodeFinder = null;
+        boolean doIntegrityCheck = true;
 
         public B withBlobStager(HollowProducer.BlobStager stager) {
             this.stager = stager;
@@ -792,6 +799,11 @@ public class HollowProducer extends AbstractHollowProducer {
         @Deprecated
         public B withHashCodeFinder(HollowObjectHashCodeFinder hashCodeFinder) {
             this.hashCodeFinder = hashCodeFinder;
+            return (B) this;
+        }
+        
+        public B noIntegrityCheck() {
+            this.doIntegrityCheck = false;
             return (B) this;
         }
 

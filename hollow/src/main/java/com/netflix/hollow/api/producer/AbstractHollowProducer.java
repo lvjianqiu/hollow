@@ -32,6 +32,7 @@ import com.netflix.hollow.api.producer.validation.ValidationStatus;
 import com.netflix.hollow.api.producer.validation.ValidationStatusException;
 import com.netflix.hollow.api.producer.validation.ValidatorListener;
 import com.netflix.hollow.core.HollowConstants;
+import com.netflix.hollow.core.HollowStateEngine;
 import com.netflix.hollow.core.read.engine.HollowBlobHeaderReader;
 import com.netflix.hollow.core.read.engine.HollowBlobReader;
 import com.netflix.hollow.core.read.engine.HollowReadStateEngine;
@@ -78,6 +79,7 @@ abstract class AbstractHollowProducer {
     final SingleProducerEnforcer singleProducerEnforcer;
     long lastSuccessfulCycle = 0;
     final HollowObjectHashCodeFinder hashCodeFinder;
+    final boolean doIntegrityCheck;
 
     boolean isInitialized;
 
@@ -90,7 +92,7 @@ abstract class AbstractHollowProducer {
                 new VersionMinterWithCounter(), null, 0,
                 DEFAULT_TARGET_MAX_TYPE_SHARD_SIZE, null,
                 new DummyBlobStorageCleaner(), new BasicSingleProducerEnforcer(),
-                null);
+                null, true);
     }
 
     // The only constructor should be that which accepts a builder
@@ -102,7 +104,7 @@ abstract class AbstractHollowProducer {
                 b.versionMinter, b.snapshotPublishExecutor,
                 b.numStatesBetweenSnapshots, b.targetMaxTypeShardSize,
                 b.metricsCollector, b.blobStorageCleaner, b.singleProducerEnforcer,
-                b.hashCodeFinder);
+                b.hashCodeFinder, b.doIntegrityCheck);
     }
 
     private AbstractHollowProducer(
@@ -117,7 +119,8 @@ abstract class AbstractHollowProducer {
             HollowMetricsCollector<HollowProducerMetrics> metricsCollector,
             HollowProducer.BlobStorageCleaner blobStorageCleaner,
             SingleProducerEnforcer singleProducerEnforcer,
-            HollowObjectHashCodeFinder hashCodeFinder) {
+            HollowObjectHashCodeFinder hashCodeFinder,
+            boolean doIntegrityCheck) {
         this.publisher = publisher;
         this.announcer = announcer;
         this.versionMinter = versionMinter;
@@ -126,6 +129,7 @@ abstract class AbstractHollowProducer {
         this.snapshotPublishExecutor = snapshotPublishExecutor;
         this.numStatesBetweenSnapshots = numStatesBetweenSnapshots;
         this.hashCodeFinder = hashCodeFinder;
+        this.doIntegrityCheck = doIntegrityCheck;
 
         HollowWriteStateEngine writeEngine = hashCodeFinder == null
                 ? new HollowWriteStateEngine()
@@ -363,12 +367,22 @@ abstract class AbstractHollowProducer {
 
             // 3. Produce a new state if there's work to do
             if (writeEngine.hasChangedSinceLastCycle()) {
+                boolean schemaChangedFromPriorVersion = readStates.hasCurrent() &&
+                        !writeEngine.hasIdenticalSchemas(readStates.current().getStateEngine());
+                if (schemaChangedFromPriorVersion) {
+                    writeEngine.addHeaderTag(HollowStateEngine.HEADER_TAG_SCHEMA_CHANGE, Boolean.TRUE.toString());
+                } else {
+                    writeEngine.getHeaderTags().remove(HollowStateEngine.HEADER_TAG_SCHEMA_CHANGE);
+                }
+
                 // 3a. Publish, run checks & validation, then announce new state consumers
                 publish(listeners, toVersion, artifacts);
 
                 ReadStateHelper candidate = readStates.roundtrip(toVersion);
                 cycleStatus.readState(candidate.pending());
-                candidate = checkIntegrity(listeners, candidate, artifacts);
+                candidate = doIntegrityCheck ? 
+                        checkIntegrity(listeners, candidate, artifacts, schemaChangedFromPriorVersion) :
+                            noIntegrityCheck(candidate, artifacts);
 
                 try {
                     validate(listeners, candidate.pending());
@@ -529,8 +543,8 @@ abstract class AbstractHollowProducer {
     void publish(ListenerSupport.Listeners listeners, long toVersion, Artifacts artifacts) throws IOException {
         Status.StageBuilder psb = listeners.firePublishStart(toVersion);
         try {
-            artifacts.snapshot = stageBlob(listeners,
-                    blobStager.openSnapshot(toVersion));
+            if(!readStates.hasCurrent() || doIntegrityCheck || numStatesUntilNextSnapshot <= 0)
+                artifacts.snapshot = stageBlob(listeners, blobStager.openSnapshot(toVersion));
 
             if (readStates.hasCurrent()) {
                 artifacts.delta = stageBlob(listeners,
@@ -649,19 +663,20 @@ abstract class AbstractHollowProducer {
 
     /**
      * Given these read states
-     * <p>
-     * * S(cur) at the currently announced version
-     * * S(pnd) at the pending version
-     * <p>
-     * Ensure that:
-     * <p>
-     * S(cur).apply(forwardDelta).checksum == S(pnd).checksum
-     * S(pnd).apply(reverseDelta).checksum == S(cur).checksum
      *
-     * @return updated read states
+     * * S(cur) at the currently announced version
+     * * S(pnd) = empty read state
+     *
+     * 1. Read in the snapshot artifact to initialize S(pnd)
+     * 2. Ensure that:
+     *   - S(cur).apply(forwardDelta).checksum == S(pnd).checksum
+     *   - S(pnd).apply(reverseDelta).checksum == S(cur).checksum
+     *
+     * @return S(cur) and S(pnd)
      */
     private ReadStateHelper checkIntegrity(
-            ListenerSupport.Listeners listeners, ReadStateHelper readStates, Artifacts artifacts) throws Exception {
+            ListenerSupport.Listeners listeners, ReadStateHelper readStates, Artifacts artifacts,
+            boolean schemaChangedFromPriorVersion) throws Exception {
         Status.StageWithStateBuilder status = listeners.fireIntegrityCheckStart(readStates.pending());
         try {
             ReadStateHelper result = readStates;
@@ -697,7 +712,16 @@ abstract class AbstractHollowProducer {
                     if (!reverseChecksum.equals(currentChecksum)) {
                         throw new HollowProducer.ChecksumValidationException(HollowProducer.Blob.Type.REVERSE_DELTA);
                     }
-                    result = readStates.swap();
+                    if (!schemaChangedFromPriorVersion) {
+                        // optimization - they have identical schemas, so just swap them
+                        log.log(Level.FINE, "current and pending have identical schemas, swapping");
+                        result = readStates.swap();
+                    } else {
+                        // undo the changes we made to the read states
+                        log.log(Level.FINE, "current and pending have non-identical schemas, reverting");
+                        applyDelta(artifacts.reverseDelta, current);
+                        applyDelta(artifacts.delta, pending);
+                    }
                 }
             }
             status.success();
@@ -708,6 +732,30 @@ abstract class AbstractHollowProducer {
         } finally {
             listeners.fireIntegrityCheckComplete(status);
         }
+    }
+    
+    private ReadStateHelper noIntegrityCheck(ReadStateHelper readStates, Artifacts artifacts) throws IOException {
+        ReadStateHelper result = readStates;
+
+        if(!readStates.hasCurrent() || 
+                (!readStates.current().getStateEngine().hasIdenticalSchemas(getWriteEngine()) && artifacts.snapshot != null)) {
+            HollowReadStateEngine pending = readStates.pending().getStateEngine();
+            readSnapshot(artifacts.snapshot, pending);
+        } else {
+            HollowReadStateEngine current = readStates.current().getStateEngine();
+
+            if (artifacts.hasDelta()) {
+                if (!artifacts.hasReverseDelta()) {
+                    throw new IllegalStateException("Both a delta and reverse delta are required");
+                }
+
+                applyDelta(artifacts.delta, current);
+                
+                result = readStates.swap();
+            }
+        }
+
+        return result;
     }
 
     private void readSnapshot(HollowProducer.Blob blob, HollowReadStateEngine stateEngine) throws IOException {
@@ -758,7 +806,7 @@ abstract class AbstractHollowProducer {
         if (announcer != null) {
             Status.StageWithStateBuilder status = listeners.fireAnnouncementStart(readState);
             try {
-                announcer.announce(readState.getVersion());
+                announcer.announce(readState.getVersion(), readState.getStateEngine().getHeaderTags());
                 status.success();
             } catch (Throwable th) {
                 status.fail(th);
