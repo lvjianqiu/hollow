@@ -21,12 +21,14 @@ import com.netflix.hollow.core.index.key.PrimaryKey;
 import com.netflix.hollow.core.memory.encoding.VarInt;
 import com.netflix.hollow.core.read.engine.HollowTypeReadState;
 import com.netflix.hollow.core.read.filter.HollowFilterConfig;
-import com.netflix.hollow.core.read.filter.HollowFilterConfig.ObjectFilterConfig;
+import com.netflix.hollow.core.read.filter.TypeFilter;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * A schema for an Object record type.
@@ -220,20 +222,30 @@ public class HollowObjectSchema extends HollowSchema {
     }
 
     public HollowObjectSchema filterSchema(HollowFilterConfig config) {
-        ObjectFilterConfig typeConfig = config.getObjectTypeConfig(getName());
+        /*
+         * This method is preserved for binary compat from before TypeFilter was introduced.
+         */
+
+        return filterSchema((TypeFilter)config);
+    }
+
+    public HollowObjectSchema filterSchema(TypeFilter filter) {
+        String type = getName();
 
         int includedFields = 0;
 
         for(int i=0;i<numFields();i++) {
-            if(typeConfig.includesField(getFieldName(i)))
+            String field = getFieldName(i);
+            if(filter.includes(type, field))
                 includedFields++;
         }
 
         HollowObjectSchema filteredSchema = new HollowObjectSchema(getName(), includedFields, primaryKey);
 
         for(int i=0;i<numFields();i++) {
-            if(typeConfig.includesField(getFieldName(i)))
-                filteredSchema.addField(getFieldName(i), getFieldType(i), getReferencedType(i));
+            String field = getFieldName(i);
+            if(filter.includes(type, field))
+                filteredSchema.addField(field, getFieldType(i), getReferencedType(i));
         }
 
         return filteredSchema;
@@ -268,11 +280,23 @@ public class HollowObjectSchema extends HollowSchema {
         for(int i=0;i<numFields();i++) {
             if(getFieldType(i) != otherSchema.getFieldType(i))
                 return false;
+            if(getFieldType(i) == FieldType.REFERENCE && !getReferencedType(i).equals(otherSchema.getReferencedType(i)))
+                return false;
             if(!getFieldName(i).equals(otherSchema.getFieldName(i)))
                 return false;
         }
 
         return true;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = getName().hashCode();
+        result = 31 * result + getSchemaType().hashCode();
+        result = 31 * result + Objects.hash(primaryKey);
+        result = 31 * result + Arrays.hashCode(fieldNames);
+        result = 31 * result + Arrays.hashCode(fieldTypes);
+        return result;
     }
 
     @Override
